@@ -25,6 +25,17 @@ public:
         regs.write(rd, read32(addr));
     }
 
+    static void execute_ldr_pc_relative(uint16_t opcode, Registers& regs, Read32Func read32) {
+        uint8_t rd_idx = (opcode >> 8) & 0x07;
+        uint32_t imm = (opcode & 0xFF) * 4; // Imediato multiplicado por 4
+
+        // O GBA exige alinhamento do PC à palavra (bits inferiores 0 e 1 limpos)
+        uint32_t addr = (regs.get_pc() & ~3) + imm;
+        
+        uint32_t value = read32(addr);
+        regs.write(rd_idx, value);
+    }
+
     // Format 7 & 8: Load/Store with Register Offset & Sign Extended Byte/Halfword
     static void execute_reg_offset(Registers& regs, uint16_t opcode, Read8Func read8, Read16Func read16, Read32Func read32, Write8Func write8, Write16Func write16, Write32Func write32) {
         uint8_t op = (opcode >> 9) & 0x07;

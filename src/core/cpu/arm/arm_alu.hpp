@@ -103,22 +103,22 @@ public:
         bool writeback = true;
 
         switch (op) {
-            case 0x0: res = rn & op2; break;                         // AND
-            case 0x1: res = rn ^ op2; break;                         // EOR
-            case 0x2: res = rn - op2; break;                         // SUB
-            case 0x3: res = op2 - rn; break;                         // RSB
-            case 0x4: res = rn + op2; break;                         // ADD
-            case 0x5: res = rn + op2 + carry; break;                 // ADC
-            case 0x6: res = rn - op2 - (!carry); break;              // SBC
-            case 0x7: res = op2 - rn - (!carry); break;              // RSC
-            case 0x8: res = rn & op2; writeback = false; break;      // TST
-            case 0x9: res = rn ^ op2; writeback = false; break;      // TEQ
-            case 0xA: res = rn - op2; writeback = false; break;      // CMP
-            case 0xB: res = rn + op2; writeback = false; break;      // CMN
-            case 0xC: res = rn | op2; break;                         // ORR
-            case 0xD: res = op2; break;                              // MOV
-            case 0xE: res = rn & (~op2); break;                      // BIC
-            case 0xF: res = ~op2; break;                             // MVN
+            case 0x0: res = rn & op2; break;                    // AND
+            case 0x1: res = rn ^ op2; break;                    // EOR
+            case 0x2: res = rn - op2; break;                    // SUB
+            case 0x3: res = op2 - rn; break;                    // RSB
+            case 0x4: res = rn + op2; break;                    // ADD
+            case 0x5: res = rn + op2 + carry; break;            // ADC
+            case 0x6: res = rn - op2 - (!carry); break;         // SBC
+            case 0x7: res = op2 - rn - (!carry); break;         // RSC
+            case 0x8: res = rn & op2; writeback = false; break; // TST
+            case 0x9: res = rn ^ op2; writeback = false; break; // TEQ
+            case 0xA: res = rn - op2; writeback = false; break; // CMP
+            case 0xB: res = rn + op2; writeback = false; break; // CMN
+            case 0xC: res = rn | op2; break;                    // ORR
+            case 0xD: res = op2; break;                         // MOV
+            case 0xE: res = rn & (~op2); break;                 // BIC
+            case 0xF: res = ~op2; break;                        // MVN
         }
 
         if (writeback) {

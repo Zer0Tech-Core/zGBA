@@ -8,41 +8,45 @@ namespace zGBA::CPU::ARM7TDMI::ARM {
 
 class ARMBranch {
 public:
-    // B e BL (Branch e Branch with Link)
     static bool execute_branch(uint32_t opcode, Registers& regs) {
         bool link = (opcode >> 24) & 1;
+        
+        // Extrai o offset de 24 bits com sinal (sign extension)
         int32_t offset = opcode & 0x00FFFFFF;
-
-        // Sign extend de 24 para 32 bits
         if (offset & 0x00800000) {
-            offset |= 0xFF000000;
+            offset |= 0xFF000000; // Extensão de sinal para 32 bits
         }
-
-        // Offset é rotacionado 2 bits para a esquerda (alinhamento de word)
+        
+        // Desloca o offset em 2 bits à esquerda (palavras de 32 bits)
         offset <<= 2;
 
-        uint32_t current_pc = regs.get_pc();
+        // Se for BL, salva o endereço de retorno (PC atual - 4, considerando o pipeline de +8)
         if (link) {
-            // Salva o PC da instrução seguinte no LR
-            regs.write(14, current_pc - 4);
+            uint32_t return_address = regs.get_pc() - 4;
+            regs.write(14, return_address); // LR (R14)
         }
 
-        // O PC armazenado já está +8 no pipeline
-        regs.set_pc(current_pc + offset);
-        return true; // Exige flush do pipeline
+        // Atualiza o PC: PC atual (que é instruction_address + 8) + offset do branch
+        uint32_t current_pc = regs.get_pc();
+        uint32_t target_address = current_pc + offset;
+        regs.write(15, target_address);
+
+        return true; // Retorna true para indicar que o PC mudou (exige flush do pipeline)
     }
 
-    // BX (Branch Exchange)
+    // Branch and Exchange (BX Rm)
     static bool execute_bx(uint32_t opcode, Registers& regs) {
         uint8_t rm_idx = opcode & 0x0F;
         uint32_t target = regs.read(rm_idx);
 
-        // Bit 0 determina o novo estado (0: ARM, 1: Thumb)
+        // O bit 0 determina o estado: 1 = Thumb, 0 = ARM
         bool thumb_mode = target & 1;
-        regs.set_flag(Registers::Flag::T, thumb_mode);
-        regs.set_pc(target & ~1U); // Alinha o endereço
+        regs.set_thumb(thumb_mode);
 
-        return true; // Exige flush do pipeline
+        // O endereço alvo limpa o bit 0
+        regs.write(15, target & ~1);
+
+        return true; // Flush do pipeline
     }
 };
 
