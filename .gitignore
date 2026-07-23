@@ -1,0 +1,15 @@
+# Compilação e Binários
+build/*
+*.o
+*.d
+zGBA
+
+# ROMs e BIOS (Apenas por garantia de direitos autorais)
+#roms/*.gba
+#roms/*.bin
+#!roms/teste.gba
+
+# IDEs e S.O.
+.vscode/
+.idea/
+.DS_Store

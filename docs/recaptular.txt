@@ -1,0 +1,31 @@
+1. Fundação e Barramento (src/core/memory/)
+Por que começar aqui: O barramento (bus.cpp e memory_map.cpp) é o sistema nervoso central do emulador. É ele que gerencia os mapeamentos de memória da BIOS, ROMs, WRAM, VRAM e os registros de I/O.
+
+O que recapitular: Como o espaço de endereçamento de 32 bits do ARM7TDMI é mapeado para os diferentes componentes do GBA.
+
+2. O Núcleo de Processamento (src/core/cpu/)
+Por que começar aqui: É onde a lógica de execução das instruções reside.
+
+O que recapitular:
+
+ARM7TDMI (arm7tdmi/): Gerenciamento de registradores, exceções e o pipeline de execução.
+
+Decodificadores (arm/ e thumb/): Como o emulador distingue e processa o conjunto de instruções ARM (32 bits) e THUMB (16 bits).
+
+3. O Subsistema Gráfico (src/core/video/)
+Por que começar aqui: A PPU (ppu.cpp) lida com a renderização de telas, modos de vídeo e tiles, sendo um dos módulos mais complexos.
+
+O que recapitular: O ciclo de varredura do LCD, os estados H-Blank/V-Blank e o tratamento de sprites/fundos.
+
+4. Áudio e Depuração (src/core/audio/ e src/debug/)
+Por que começar aqui: Mostra o suporte periférico e as ferramentas de diagnóstico.
+
+O que recapitular: Os canais da APU (apu.cpp, mixer.cpp) e a implementação do EmbeddedICE (debugger.cpp) para rastreamento de execução.
+
+5. Camada de Plataforma e Execução (src/platform/)
+Por que começar aqui: É a cola que une o núcleo do emulador (core) com o mundo exterior (sistema operacional, janelas e áudio nativo).
+
+O que recapitular: O loop principal em emulador.cpp, o carregamento de ROMs (rom_loader.cpp) e o gerenciamento de entradas (input.cpp) e renderização (renderer.cpp).
+
+6. Validação (tests/)
+Por que começar aqui: Confere a cobertura de testes unitários para CPU, memória, vídeo e áudio.
