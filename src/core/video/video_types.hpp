@@ -33,19 +33,19 @@ constexpr size_t OAM_SIZE  = 1 * 1024;   // 1 KB
 using Color16 = uint16_t;
 
 // Conversão BGR555 -> ARGB8888 com expansão precisa de bits
-inline uint32_t bgr555_to_argb8888(Color16 color) {
-    // Extrai componentes de 5 bits
-    uint32_t r = (color >>  0) & 0x1F;
-    uint32_t g = (color >>  5) & 0x1F;
-    uint32_t b = (color >> 10) & 0x1F;
-    
-    // Expansão para 8 bits com distribuição uniforme
-    // Método: (valor * 255) / 31, otimizado com shifts
-    r = (r << 3) | (r >> 2);  // r * 8 + r/4
-    g = (g << 3) | (g >> 2);
-    b = (b << 3) | (b >> 2);
-    
-    return 0xFF000000 | (r << 16) | (g << 8) | b;
+inline uint32_t bgr555_to_argb8888(uint16_t color16) {
+    // Extrai os canais de 5 bits do formato BGR555 do GBA
+    uint8_t r5 = (color16 >> 0)  & 0x1F;
+    uint8_t g5 = (color16 >> 5)  & 0x1F;
+    uint8_t b5 = (color16 >> 10) & 0x1F;
+
+    // Expande linearmente de 5 bits (0-31) para 8 bits (0-255)
+    uint8_t r8 = (r5 << 3) | (r5 >> 2);
+    uint8_t g8 = (g5 << 3) | (g5 >> 2);
+    uint8_t b8 = (b5 << 3) | (b5 >> 2);
+
+    // Retorna no formato ARGB8888 (com Alfa total opaco = 0xFF)
+    return 0xFF000000 | (r8 << 16) | (g8 << 8) | b8;
 }
 
 // ============================================================================

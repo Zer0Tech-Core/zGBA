@@ -1,0 +1,1112 @@
+zero@DESKTOP-SPF6KES:~/zGBA$ code .
+zero@DESKTOP-SPF6KES:~/zGBA$ cat src/core/video/ppu.cpp
+#include "ppu.hpp"
+#include "src/core/memory/bus.hpp"
+#include <cstring>
+#include <algorithm>
+
+namespace zgba::video {
+
+// ============================================================================
+// CONSTRUTOR E RESET
+// ============================================================================
+
+PPU::PPU() {
+    reset();
+}
+
+void PPU::reset() {
+    scanline_cycles = 0;
+    vcount = 0;
+    dispcnt.raw = 0;
+    dispstat.raw = 0;
+
+    for (auto& cnt : bgcnt) cnt.raw = 0;
+    bghofs.fill(0);
+    bgvofs.fill(0);
+
+    vram.fill(0);
+    pram.fill(0);
+    oam.fill(0);
+    framebuffer.fill(0xFF000000); // Preto opaco
+
+    scanline_color_buffer.fill(0);
+    scanline_priority_buffer.fill(4); // Prioridade mais baixa
+    scanline_source_buffer.fill(5);   // Backdrop
+    scanline_buffer.fill(0);
+}
+
+// ============================================================================
+// STEP - MÁQUINA DE ESTADOS DA PPU
+// ============================================================================
+
+void PPU::step(uint32_t cycles, memory::Bus& bus) {
+    scanline_cycles += cycles;
+
+    // ============================================================
+    // 1. Processamento do H-Blank (entra após 1006 ciclos)
+    // ============================================================
+    if (scanline_cycles >= CYCLES_PER_HDRAW && !dispstat.hblank_flag) {
+        dispstat.hblank_flag = 1;
+        if (dispstat.hblank_irq_enable) {
+            bus.request_interrupt(1 << 1); // IRQ HBlank
+        }
+    }
+
+    // ============================================================
+    // 2. Fim da Scanline (após 1232 ciclos)
+    // ============================================================
+    if (scanline_cycles >= CYCLES_PER_SCANLINE) {
+        scanline_cycles -= CYCLES_PER_SCANLINE;
+        dispstat.hblank_flag = 0;
+
+        // Renderiza a linha visível se estivermos em VDraw (0..159)
+        if (vcount < SCREEN_HEIGHT) {
+            render_scanline();
+        }
+
+        vcount++;
+
+        // ============================================================
+        // 3. Checagem do VCount Target IRQ
+        // ============================================================
+        if (vcount == dispstat.vcount_setting) {
+            dispstat.vcount_match_flag = 1;
+            if (dispstat.vcount_irq_enable) {
+                bus.request_interrupt(1 << 2); // IRQ VCount Match
+            }
+        } else {
+            dispstat.vcount_match_flag = 0;
+        }
+
+        // ============================================================
+        // 4. Início do V-Blank (Linha 160)
+        // ============================================================
+        if (vcount == SCREEN_HEIGHT) {
+            dispstat.vblank_flag = 1;
+            if (dispstat.vblank_irq_enable) {
+                bus.request_interrupt(1 << 0); // IRQ VBlank - CRÍTICO!
+            }
+        }
+        // ============================================================
+        // 5. Fim do Frame (Linha 228 -> Reseta para 0)
+        // ============================================================
+        else if (vcount >= TOTAL_SCANLINES) {
+            vcount = 0;
+            dispstat.vblank_flag = 0;
+        }
+    }
+}
+// ============================================================================
+// RENDERIZAÇÃO PRINCIPAL
+// ============================================================================
+
+void PPU::render_scanline() {
+    // Backdrop padrão (Cor 0 da paleta de BG)
+    uint16_t backdrop_color = *reinterpret_cast<uint16_t*>(&pram[0]);
+    scanline_color_buffer.fill(backdrop_color);
+    scanline_priority_buffer.fill(4); // Prioridade mais baixa
+    scanline_source_buffer.fill(5);   // Backdrop
+
+    // Se o display estiver desativado (forced_blank), apenas mostra o backdrop
+    if (dispcnt.forced_blank) {
+        // Copia o backdrop para o framebuffer
+        uint32_t* fb_line = &framebuffer[vcount * SCREEN_WIDTH];
+        uint32_t argb_color = bgr555_to_argb8888(backdrop_color);
+        for (int x = 0; x < SCREEN_WIDTH; ++x) {
+            fb_line[x] = argb_color;
+        }
+        return;
+    }
+
+    // Seleciona o modo de vídeo atual
+    switch (dispcnt.video_mode) {
+        case 0:
+            render_mode0_scanline();
+            break;
+        case 3:
+            render_mode3_scanline();
+            break;
+        case 4:
+            render_mode4_scanline();
+            break;
+        case 5:
+            render_mode5_scanline();
+            break;
+        default:
+            // Modos 1 e 2 (Affine) não implementados ainda
+            break;
+    }
+
+    // Renderiza Sprites (OBJ) por cima dos fundos conforme prioridades
+    if (dispcnt.obj_enable) {
+        render_sprites_scanline();
+    }
+
+    // Copia a linha processada para o framebuffer final ARGB8888
+    uint32_t* fb_line = &framebuffer[vcount * SCREEN_WIDTH];
+    for (int x = 0; x < SCREEN_WIDTH; ++x) {
+        fb_line[x] = bgr555_to_argb8888(scanline_color_buffer[x]);
+    }
+}
+
+// ============================================================================
+// MODO 0 - TILE-BASED BACKGROUNDS (SCANLINE)
+// ============================================================================
+
+void PPU::render_mode0_scanline() {
+    // ============================================================
+    // 1. Coletar backgrounds ativos e ordenar por prioridade
+    // ============================================================
+    struct BGEntry {
+        int id;
+        int priority;
+    };
+
+    BGEntry active_bgs[4];
+    int bg_count = 0;
+
+    auto add_bg = [&](int id, bool enabled) {
+        if (enabled && id >= 0 && id < 4) {
+            active_bgs[bg_count++] = {id, bgcnt[id].priority};
+        }
+    };
+
+    add_bg(0, dispcnt.bg0_enable);
+    add_bg(1, dispcnt.bg1_enable);
+    add_bg(2, dispcnt.bg2_enable);
+    add_bg(3, dispcnt.bg3_enable);
+
+    // Ordena por prioridade (menor número = maior prioridade)
+    std::sort(active_bgs, active_bgs + bg_count, [](const BGEntry& a, const BGEntry& b) {
+        if (a.priority != b.priority)
+            return a.priority < b.priority;
+        return a.id < b.id;
+    });
+
+    // ============================================================
+    // 2. Renderizar cada background na ordem de prioridade
+    // ============================================================
+    for (int i = 0; i < bg_count; ++i) {
+        int bg = active_bgs[i].id;
+        const auto& cnt = bgcnt[bg];
+
+        // Scroll offsets (mascarados para 9 bits)
+        uint16_t hofs = bghofs[bg] & 0x1FF;
+        uint16_t vofs = bgvofs[bg] & 0x1FF;
+
+        // Determina dimensões do mapa
+        int map_width_tiles = cnt.get_map_width_tiles();
+        int map_height_tiles = cnt.get_map_height_tiles();
+        bool wide = cnt.is_wide_map();
+        bool tall = cnt.is_tall_map();
+
+        // Posição Y no mapa com scroll vertical
+        int map_y = (vcount + vofs) & 0x1FF;
+        int tile_row = (map_y / 8) % map_height_tiles;
+        int fine_y = map_y % 8;
+
+        // Base do charblock
+        uint32_t char_base = cnt.char_block_base * 16384; // 16KB por bloco
+        bool is_8bpp = (cnt.color_mode == 1);
+
+        // ============================================================
+        // 3. Loop principal de pixels (240 pixels por linha)
+        // ============================================================
+        for (int screen_x = 0; screen_x < SCREEN_WIDTH; ++screen_x) {
+            // Posição X no mapa com scroll horizontal
+            int map_x = (screen_x + hofs) & 0x1FF;
+            int tile_col = (map_x / 8) % map_width_tiles;
+            int fine_x = map_x % 8;
+
+            // ============================================================
+            // 4. Calcular endereço do Screenblock (mapa de tiles)
+            // ============================================================
+            int block_x = (map_x >= 256) ? 1 : 0;
+            int block_y = (map_y >= 256) ? (wide ? 2 : 1) : 0;
+            int block_offset = block_x + block_y;
+            uint32_t screen_base = cnt.screen_block_base * 2048; // 2KB por bloco
+
+            uint32_t map_entry_addr = screen_base + (block_offset * 2048) +
+                                      ((tile_row * 32 + tile_col) * 2);
+
+            // Verifica limites de VRAM
+            if (map_entry_addr + 1 >= VRAM_SIZE) continue;
+
+            // ============================================================
+            // 5. Ler entrada do mapa (map entry)
+            // ============================================================
+            uint16_t map_entry = *reinterpret_cast<const uint16_t*>(&vram[map_entry_addr]);
+
+            uint16_t tile_idx = map_entry & 0x03FF;
+            bool h_flip = (map_entry & 0x0400) != 0;
+            bool v_flip = (map_entry & 0x0800) != 0;
+            uint8_t palette_bank = (map_entry >> 12) & 0x0F;
+
+            // Aplica flip se necessário
+            int px = h_flip ? (7 - fine_x) : fine_x;
+            int py = v_flip ? (7 - fine_y) : fine_y;
+
+            // ============================================================
+            // 6. Buscar pixel do tile na VRAM
+            // ============================================================
+            uint8_t color_idx = 0;
+            uint32_t tile_addr = char_base;
+
+            if (is_8bpp) {
+                // Modo 8-bpp (256 cores)
+                tile_addr += (tile_idx * 64) + (py * 8) + px;
+                if (tile_addr < VRAM_SIZE) {
+                    color_idx = vram[tile_addr];
+                }
+            } else {
+                // Modo 4-bpp (16 cores)
+                tile_addr += (tile_idx * 32) + (py * 4) + (px / 2);
+                if (tile_addr < VRAM_SIZE) {
+                    uint8_t data = vram[tile_addr];
+                    color_idx = (px & 1) ? (data >> 4) : (data & 0x0F);
+                }
+            }
+
+            // ============================================================
+            // 7. Índice 0 = transparente (pula)
+            // ============================================================
+            if (color_idx == 0) continue;
+
+            // ============================================================
+            // 8. Consultar Palette RAM para obter a cor
+            // ============================================================
+            uint16_t color_val = 0;
+            if (is_8bpp) {
+                uint32_t pal_addr = color_idx * 2;
+                color_val = *reinterpret_cast<const uint16_t*>(&pram[pal_addr]);
+            } else {
+                uint32_t pal_addr = (palette_bank * 16 + color_idx) * 2;
+                color_val = *reinterpret_cast<const uint16_t*>(&pram[pal_addr]);
+            }
+
+            // ============================================================
+            // 9. Verificar prioridade antes de escrever
+            // ============================================================
+            if (cnt.priority < scanline_priority_buffer[screen_x]) {
+                scanline_color_buffer[screen_x] = color_val;
+                scanline_priority_buffer[screen_x] = cnt.priority;
+                scanline_source_buffer[screen_x] = bg;
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// MODO 3 - FRAMEBUFFER (240x160, 16bpp)
+// ============================================================================
+
+void PPU::render_mode3_scanline() {
+    const uint16_t* vram16 = reinterpret_cast<const uint16_t*>(vram.data());
+    uint32_t line_offset = vcount * SCREEN_WIDTH;
+
+    for (int x = 0; x < SCREEN_WIDTH; ++x) {
+        uint32_t addr = line_offset + x;
+        if (addr < VRAM_SIZE / 2) {
+            scanline_color_buffer[x] = vram16[addr];
+            scanline_priority_buffer[x] = 0; // Prioridade máxima
+            scanline_source_buffer[x] = 0;
+        }
+    }
+}
+
+// ============================================================================
+// MODO 4 - FRAMEBUFFER INDEXADO (240x160, 8bpp)
+// ============================================================================
+
+void PPU::render_mode4_scanline() {
+    uint32_t frame_offset = dispcnt.frame_select ? 0xA000 : 0x0000;
+    uint32_t line_offset = frame_offset + (vcount * SCREEN_WIDTH);
+
+    for (int x = 0; x < SCREEN_WIDTH; ++x) {
+        uint32_t addr = line_offset + x;
+        if (addr < VRAM_SIZE) {
+            uint8_t palette_idx = vram[addr];
+            if (palette_idx != 0) {
+                uint16_t color = *reinterpret_cast<const uint16_t*>(&pram[palette_idx * 2]);
+                scanline_color_buffer[x] = color;
+                scanline_priority_buffer[x] = 0;
+                scanline_source_buffer[x] = 0;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// MODO 5 - FRAMEBUFFER PEQUENO (160x128, 16bpp)
+// ============================================================================
+
+void PPU::render_mode5_scanline() {
+    if (vcount >= 128) return; // Fora da área renderizável no Modo 5
+
+    uint32_t frame_offset = dispcnt.frame_select ? 0xA000 : 0x0000;
+    const uint16_t* vram16 = reinterpret_cast<const uint16_t*>(&vram[frame_offset]);
+    uint32_t line_offset = vcount * 160;
+
+    for (int x = 0; x < 160; ++x) {
+        uint32_t addr = line_offset + x;
+        if (addr < (VRAM_SIZE - frame_offset) / 2) {
+            scanline_color_buffer[x] = vram16[addr];
+            scanline_priority_buffer[x] = 0;
+            scanline_source_buffer[x] = 0;
+        }
+    }
+}
+
+// ============================================================================
+// RENDERIZAÇÃO DE SPRITES (SCANLINE)
+// ============================================================================
+
+void PPU::render_sprites_scanline() {
+    if (!dispcnt.obj_enable) return;
+
+    const SpriteOAM* oam_entries = reinterpret_cast<const SpriteOAM*>(oam.data());
+
+    // Itera de trás para frente (sprite 0 tem prioridade máxima)
+    for (int i = 127; i >= 0; --i) {
+        const auto& sprite = oam_entries[i];
+
+        uint16_t attr0 = sprite.attr0;
+        uint16_t attr1 = sprite.attr1;
+        uint16_t attr2 = sprite.attr2;
+
+        // ============================================================
+        // 1. Extrair atributos do sprite
+        // ============================================================
+        int obj_y = attr0 & 0x00FF;
+        if (obj_y >= 160) obj_y -= 256;
+
+        int obj_mode = (attr0 >> 8) & 0x03;
+        if (obj_mode == 2) continue; // Modo reservado/transparente
+
+        bool rot_scale = (attr0 & 0x0100) != 0;
+        bool attr0_bit9 = (attr0 & 0x0200) != 0;
+
+        // Desativação de sprite (quando rot_scale = 0 e bit9 = 1)
+        if (!rot_scale && attr0_bit9) continue;
+
+        int shape = (attr0 >> 14) & 0x03;
+        int size = (attr1 >> 14) & 0x03;
+
+        // ============================================================
+        // 2. Dimensões do sprite usando tabela SPRITE_DIMS
+        // ============================================================
+        int width = SPRITE_DIMS[shape][size][0];
+        int height = SPRITE_DIMS[shape][size][1];
+
+        // Se dimensões inválidas, pula o sprite
+        if (width == 0 || height == 0) continue;
+
+        if (rot_scale && attr0_bit9) {
+            width *= 2;
+            height *= 2;
+        }
+
+        // ============================================================
+        // 3. Verifica se a linha atual intersecta o sprite
+        // ============================================================
+        if (vcount < obj_y || vcount >= obj_y + height) continue;
+
+        int obj_x = attr1 & 0x01FF;
+        if (obj_x >= 240) obj_x -= 512;
+
+        bool h_flip = !rot_scale && ((attr1 & 0x1000) != 0);
+        bool v_flip = !rot_scale && ((attr1 & 0x2000) != 0);
+
+        uint16_t tile_idx = attr2 & 0x03FF;
+        uint8_t priority = (attr2 >> 10) & 0x03;
+        uint8_t palette_bank = (attr2 >> 12) & 0x0F;
+        bool is_256_color = (attr0 & 0x2000) != 0;
+
+        int row_in_obj = vcount - obj_y;
+        if (v_flip) row_in_obj = height - 1 - row_in_obj;
+
+        // Base da VRAM de objetos (OBJ VRAM começa em 0x10000)
+        uint32_t obj_vram_base = 0x10000;
+
+        // ============================================================
+        // 4. Renderizar pixels horizontais do sprite
+        // ============================================================
+        for (int x_in_obj = 0; x_in_obj < width; ++x_in_obj) {
+            int screen_x = obj_x + x_in_obj;
+            if (screen_x < 0 || screen_x >= SCREEN_WIDTH) continue;
+
+            // Verifica prioridade antes de renderizar
+            if (priority >= scanline_priority_buffer[screen_x]) continue;
+
+            int px = h_flip ? (width - 1 - x_in_obj) : x_in_obj;
+            int py = row_in_obj;
+
+            int tile_width_in_tiles = width / 8;
+            int cur_tile_x = px / 8;
+            int cur_tile_y = py / 8;
+            int sub_px_x = px % 8;
+            int sub_px_y = py % 8;
+
+            // ============================================================
+            // 5. Calcular índice do tile (1D ou 2D mapping)
+            // ============================================================
+            uint32_t target_tile_num;
+            if (dispcnt.obj_character_mapping == 1) {
+                // 1D mapping (linear)
+                target_tile_num = tile_idx + (cur_tile_y * tile_width_in_tiles) + cur_tile_x;
+            } else {
+                // 2D mapping (32 tiles por linha)
+                target_tile_num = tile_idx + (cur_tile_y * 32) + cur_tile_x;
+            }
+
+            // ============================================================
+            // 6. Buscar pixel do tile na VRAM de objetos
+            // ============================================================
+            uint32_t tile_bytes = is_256_color ? 64 : 32;
+            uint32_t pixel_addr = obj_vram_base + (target_tile_num * tile_bytes);
+
+            uint8_t color_idx = 0;
+            if (is_256_color) {
+                pixel_addr += (sub_px_y * 8) + sub_px_x;
+                if (pixel_addr < VRAM_SIZE) {
+                    color_idx = vram[pixel_addr];
+                }
+            } else {
+                pixel_addr += (sub_px_y * 4) + (sub_px_x / 2);
+                if (pixel_addr < VRAM_SIZE) {
+                    uint8_t data = vram[pixel_addr];
+                    color_idx = (sub_px_x & 1) ? (data >> 4) : (data & 0x0F);
+                }
+            }
+
+            // Índice 0 = transparente
+            if (color_idx == 0) continue;
+
+            // ============================================================
+            // 7. Consultar Palette RAM de Sprites (offset 0x200)
+            // ============================================================
+            uint32_t pal_addr = 0x200;
+            if (is_256_color) {
+                pal_addr += color_idx * 2;
+            } else {
+                pal_addr += (palette_bank * 16 + color_idx) * 2;
+            }
+
+            if (pal_addr + 1 < PRAM_SIZE) {
+                uint16_t color_val = *reinterpret_cast<const uint16_t*>(&pram[pal_addr]);
+                scanline_color_buffer[screen_x] = color_val;
+                scanline_priority_buffer[screen_x] = priority;
+                scanline_source_buffer[screen_x] = 4; // OBJ
+            }
+        }
+    }
+}
+
+// ============================================================================
+// LEITURA/ESCRITA DE REGISTRADORES
+// ============================================================================
+
+uint16_t PPU::read_register(uint32_t addr) const {
+    switch (addr & 0x00FFFFFF) {
+        case 0x0000: return dispcnt.raw;
+        case 0x0004: return dispstat.raw;
+        case 0x0006: return vcount;
+        case 0x0008: return bgcnt[0].raw;
+        case 0x000A: return bgcnt[1].raw;
+        case 0x000C: return bgcnt[2].raw;
+        case 0x000E: return bgcnt[3].raw;
+        case 0x0010: return bghofs[0];
+        case 0x0012: return bgvofs[0];
+        case 0x0014: return bghofs[1];
+        case 0x0016: return bgvofs[1];
+        case 0x0018: return bghofs[2];
+        case 0x001A: return bgvofs[2];
+        case 0x001C: return bghofs[3];
+        case 0x001E: return bgvofs[3];
+        default: return 0;
+    }
+}
+
+void PPU::write_register(uint32_t addr, uint16_t val) {
+    switch (addr & 0x00FFFFFF) {
+        case 0x0000:
+            dispcnt.raw = val;
+            break;
+        case 0x0004:
+            // Bits read-only: 0-2 (status flags)
+            dispstat.raw = (dispstat.raw & 0x0007) | (val & ~0x0007);
+            break;
+        case 0x0008:
+            bgcnt[0].raw = val;
+            break;
+        case 0x000A:
+            bgcnt[1].raw = val;
+            break;
+        case 0x000C:
+            bgcnt[2].raw = val;
+            break;
+        case 0x000E:
+            bgcnt[3].raw = val;
+            break;
+        case 0x0010:
+            bghofs[0] = val & 0x1FF;
+            break;
+        case 0x0012:
+            bgvofs[0] = val & 0x1FF;
+            break;
+        case 0x0014:
+            bghofs[1] = val & 0x1FF;
+            break;
+        case 0x0016:
+            bgvofs[1] = val & 0x1FF;
+            break;
+        case 0x0018:
+            bghofs[2] = val & 0x1FF;
+            break;
+        case 0x001A:
+            bgvofs[2] = val & 0x1FF;
+            break;
+        case 0x001C:
+            bghofs[3] = val & 0x1FF;
+            break;
+        case 0x001E:
+            bgvofs[3] = val & 0x1FF;
+            break;
+        default:
+            break;
+    }
+}
+
+// ============================================================================
+// MÉTODOS AUXILIARES
+// ============================================================================
+
+uint8_t PPU::fetch_tile_pixel_4bpp(uint32_t tile_addr, int x, int y) const {
+    // x e y devem estar no range 0-7
+    uint32_t addr = tile_addr + (y * 4) + (x / 2);
+    if (addr >= VRAM_SIZE) return 0;
+    uint8_t data = vram[addr];
+    return (x & 1) ? (data >> 4) : (data & 0x0F);
+}
+
+uint8_t PPU::fetch_tile_pixel_8bpp(uint32_t tile_addr, int x, int y) const {
+    uint32_t addr = tile_addr + (y * 8) + x;
+    if (addr >= VRAM_SIZE) return 0;
+    return vram[addr];
+}
+
+uint16_t PPU::get_palette_color(uint32_t pal_addr) const {
+    if (pal_addr + 1 >= PRAM_SIZE) return 0;
+    return *reinterpret_cast<const uint16_t*>(&pram[pal_addr]);
+}
+
+Color16 PPU::get_bg_palette_color(uint8_t palette_idx, uint8_t color_idx) const {
+    uint32_t pal_addr = (palette_idx * 16 + color_idx) * 2;
+    return get_palette_color(pal_addr);
+}
+
+Color16 PPU::get_obj_palette_color(uint8_t palette_idx, uint8_t color_idx) const {
+    uint32_t pal_addr = 0x200 + (palette_idx * 16 + color_idx) * 2;
+    return get_palette_color(pal_addr);
+}
+
+} // namespace zgba::videozero@DESKTOP-SPF6KES:~/zGBA$ cat src/core/video/ppu.hpp
+#ifndef ZGBA_VIDEO_PPU_HPP
+#define ZGBA_VIDEO_PPU_HPP
+
+#include "video_types.hpp"
+#include <array>
+#include <cstdint>
+#include <vector>
+
+namespace zgba::memory {
+class Bus;
+}
+
+namespace zgba::video {
+
+class PPU {
+public:
+    PPU();
+    ~PPU() = default;
+
+    void reset();
+
+    // Avança o timing do PPU baseado nos ciclos executados pela CPU
+    void step(uint32_t cpu_cycles, memory::Bus& bus);
+
+    // Leitura e Escrita de Registradores de Vídeo (Mapeados em 0x04000000)
+    uint16_t read_register(uint32_t addr) const;
+    void write_register(uint32_t addr, uint16_t value);
+
+    // Acesso às Memórias Dedicadas
+    uint8_t* get_vram() { return vram.data(); }
+    const uint8_t* get_vram() const { return vram.data(); }
+    uint8_t* get_pram() { return pram.data(); }
+    const uint8_t* get_pram() const { return pram.data(); }
+    uint8_t* get_oam()  { return oam.data(); }
+    const uint8_t* get_oam() const { return oam.data(); }
+
+    // Retorna o Framebuffer Interno completo (240x160 pixels de 32-bit ARGB)
+    const std::array<uint32_t, SCREEN_WIDTH * SCREEN_HEIGHT>& get_framebuffer() const {
+        return framebuffer;
+    }
+
+    // Métodos auxiliares para depuração
+    bool is_vblank() const { return dispstat.vblank_flag != 0; }
+    uint16_t get_vcount() const { return vcount; }
+
+private:
+    // Métodos de renderização (apenas um conjunto)
+    void render_scanline();
+    void render_mode0_scanline();
+    void render_mode3_scanline();
+    void render_mode4_scanline();
+    void render_mode5_scanline();
+    void render_sprites_scanline();
+
+    // Métodos auxiliares de renderização
+    uint8_t fetch_tile_pixel_4bpp(uint32_t tile_addr, int x, int y) const;
+    uint8_t fetch_tile_pixel_8bpp(uint32_t tile_addr, int x, int y) const;
+    uint16_t get_palette_color(uint32_t pal_addr) const;
+    Color16 get_bg_palette_color(uint8_t palette_idx, uint8_t color_idx) const;
+    Color16 get_obj_palette_color(uint8_t palette_idx, uint8_t color_idx) const;
+
+    // Ciclos acumulados na scanline atual
+    uint32_t scanline_cycles{0};
+
+    // Registradores de Controle
+    DISPCNT  dispcnt;
+    DISPSTAT dispstat;
+    uint16_t vcount{0}; // Line counter (0-227)
+
+    std::array<BGCNT, 4> bgcnt{};
+    std::array<uint16_t, 4> bghofs{};
+    std::array<uint16_t, 4> bgvofs{};
+
+    // Memórias Dedicadas (VRAM, Palette RAM, OAM)
+    alignas(4) std::array<uint8_t, VRAM_SIZE> vram{};
+    alignas(4) std::array<uint8_t, PRAM_SIZE> pram{};
+    alignas(4) std::array<uint8_t, OAM_SIZE>  oam{};
+
+    // Buffer de Tela Final (ARGB8888)
+    std::array<uint32_t, SCREEN_WIDTH * SCREEN_HEIGHT> framebuffer{};
+
+    // Buffers de Scanline (tipos corrigidos)
+    std::array<uint16_t, SCREEN_WIDTH> scanline_color_buffer{};     // Cores BGR555
+    std::array<uint8_t, SCREEN_WIDTH> scanline_priority_buffer{};   // Prioridade (0-4)
+    std::array<uint8_t, SCREEN_WIDTH> scanline_source_buffer{};     // 0-3 = BG0-BG3, 4 = OBJ, 5 = Backdrop
+
+    // Linha de trabalho auxiliar (mantido para compatibilidade)
+    std::array<uint16_t, SCREEN_WIDTH> scanline_buffer{};
+};
+
+} // namespace zgba::video
+
+#endif // ZGBA_VIDEO_PPU_HPPzero@DESKTOP-SPF6KES:~/zGBA$ cat src/core/video/video_types.hpp
+#ifndef ZGBA_VIDEO_TYPES_HPP
+#define ZGBA_VIDEO_TYPES_HPP
+
+#include <cstddef>
+#include <cstdint>
+#include <array>
+
+namespace zgba::video {
+
+// ============================================================================
+// CONSTANTES FÍSICAS DO GBA
+// ============================================================================
+
+constexpr int SCREEN_WIDTH     = 240;
+constexpr int SCREEN_HEIGHT    = 160;
+constexpr int VBLANK_LINES     = 68;
+constexpr int TOTAL_SCANLINES  = SCREEN_HEIGHT + VBLANK_LINES; // 228
+
+// Timing de Ciclos por Scanline
+constexpr int CYCLES_PER_HDRAW   = 1006;
+constexpr int CYCLES_PER_HBLANK  = 226;
+constexpr int CYCLES_PER_SCANLINE = CYCLES_PER_HDRAW + CYCLES_PER_HBLANK; // 1232
+
+// Tamanhos de Memória Dedicada de Vídeo
+constexpr size_t VRAM_SIZE = 96 * 1024;  // 96 KB
+constexpr size_t PRAM_SIZE = 1 * 1024;   // 1 KB
+constexpr size_t OAM_SIZE  = 1 * 1024;   // 1 KB
+
+// ============================================================================
+// TIPO DE COR BGR555
+// ============================================================================
+
+using Color16 = uint16_t;
+
+// Conversão BGR555 -> ARGB8888 com expansão precisa de bits
+inline uint32_t bgr555_to_argb8888(Color16 color) {
+    // Extrai componentes de 5 bits
+    uint32_t r = (color >>  0) & 0x1F;
+    uint32_t g = (color >>  5) & 0x1F;
+    uint32_t b = (color >> 10) & 0x1F;
+
+    // Expansão para 8 bits com distribuição uniforme
+    // Método: (valor * 255) / 31, otimizado com shifts
+    r = (r << 3) | (r >> 2);  // r * 8 + r/4
+    g = (g << 3) | (g >> 2);
+    b = (b << 3) | (b >> 2);
+
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
+}
+
+// ============================================================================
+// REGISTRADOR: DISPCNT (0x04000000) - DISPLAY CONTROL
+// ============================================================================
+
+union DISPCNT {
+    uint16_t raw;
+    struct {
+        // Bits 0-2: Modo de vídeo (0-5)
+        uint16_t video_mode : 3;
+
+        // Bit 3: Modo GBC (read-only, sempre 0 no GBA)
+        uint16_t gbc_mode : 1;
+
+        // Bit 4: Seleção de frame para display (Modos 4 e 5)
+        uint16_t frame_select : 1;
+
+        // Bit 5: HBlank Interval Free (permite acesso à VRAM durante HBlank)
+        uint16_t hblank_interval_free : 1;
+
+        // Bit 6: Mapeamento de caracteres de OBJ (0 = 2D, 1 = 1D)
+        uint16_t obj_character_mapping : 1;
+
+        // Bit 7: Forced Blank (desativa a tela)
+        uint16_t forced_blank : 1;
+
+        // Bits 8-11: Habilitação de backgrounds
+        uint16_t bg0_enable : 1;
+        uint16_t bg1_enable : 1;
+        uint16_t bg2_enable : 1;
+        uint16_t bg3_enable : 1;
+
+        // Bit 12: Habilitação de sprites (OBJ)
+        uint16_t obj_enable : 1;
+
+        // Bit 13: Habilitação da Window 0
+        uint16_t win0_enable : 1;
+
+        // Bit 14: Habilitação da Window 1
+        uint16_t win1_enable : 1;
+
+        // Bit 15: Habilitação da OBJ Window
+        uint16_t obj_win_enable : 1;
+    };
+
+    // Construtores para facilitar o uso
+    DISPCNT() : raw(0) {}
+    explicit DISPCNT(uint16_t val) : raw(val) {}
+
+    // Operadores para conversão implícita
+    operator uint16_t() const { return raw; }
+    DISPCNT& operator=(uint16_t val) { raw = val; return *this; }
+};
+
+// ============================================================================
+// REGISTRADOR: DISPSTAT (0x04000004) - DISPLAY STATUS
+// ============================================================================
+
+union DISPSTAT {
+    uint16_t raw;
+    struct {
+        // Bit 0: Flag VBlank (0 = VDraw, 1 = VBlank) - READ-ONLY
+        uint16_t vblank_flag : 1;
+
+        // Bit 1: Flag HBlank (0 = HDraw, 1 = HBlank) - READ-ONLY
+        uint16_t hblank_flag : 1;
+
+        // Bit 2: Flag VCount Match - READ-ONLY
+        uint16_t vcount_match_flag : 1;
+
+        // Bit 3: Habilita IRQ VBlank
+        uint16_t vblank_irq_enable : 1;
+
+        // Bit 4: Habilita IRQ HBlank
+        uint16_t hblank_irq_enable : 1;
+
+        // Bit 5: Habilita IRQ VCount
+        uint16_t vcount_irq_enable : 1;
+
+        // Bits 6-7: Reservados (unused)
+        uint16_t unused : 2;
+
+        // Bits 8-15: Valor de comparação do VCount (0-227)
+        uint16_t vcount_setting : 8;
+    };
+
+    DISPSTAT() : raw(0) {}
+    explicit DISPSTAT(uint16_t val) : raw(val) {}
+
+    operator uint16_t() const { return raw; }
+    DISPSTAT& operator=(uint16_t val) { raw = val; return *this; }
+};
+
+// ============================================================================
+// REGISTRADOR: BGxCNT (0x04000008 + i*2) - BACKGROUND CONTROL
+// ============================================================================
+
+union BGCNT {
+    uint16_t raw;
+    struct {
+        // Bits 0-1: Prioridade (0 = mais alta, 3 = mais baixa)
+        uint16_t priority : 2;
+
+        // Bits 2-3: Base do Charblock (0-3, cada 16KB)
+        uint16_t char_block_base : 2;
+
+        // Bits 4-5: Reservados (unused)
+        uint16_t unused : 2;
+
+        // Bit 6: Mosaico (habilita efeito de mosaico)
+        uint16_t mosaic : 1;
+
+        // Bit 7: Modo de cor (0 = 4bpp/16 paletas, 1 = 8bpp/256 cores)
+        uint16_t color_mode : 1;
+
+        // Bits 8-12: Base do Screenblock (0-31, cada 2KB)
+        uint16_t screen_block_base : 5;
+
+        // Bit 13: Wraparound (apenas para BGs afim - Modos 1 e 2)
+        uint16_t wraparound : 1;
+
+        // Bits 14-15: Tamanho do mapa
+        // 0 = 256x256, 1 = 512x256, 2 = 256x512, 3 = 512x512
+        uint16_t screen_size : 2;
+    };
+
+    BGCNT() : raw(0) {}
+    explicit BGCNT(uint16_t val) : raw(val) {}
+
+    operator uint16_t() const { return raw; }
+    BGCNT& operator=(uint16_t val) { raw = val; return *this; }
+
+    // Métodos auxiliares para calcular dimensões do mapa
+    int get_map_width_tiles() const {
+        return (screen_size & 1) ? 64 : 32;
+    }
+
+    int get_map_height_tiles() const {
+        return (screen_size & 2) ? 64 : 32;
+    }
+
+    bool is_wide_map() const { return (screen_size & 1) != 0; }
+    bool is_tall_map() const { return (screen_size & 2) != 0; }
+};
+
+// ============================================================================
+// ESTRUTURA DE SPRITE NA OAM
+// ============================================================================
+
+struct SpriteOAM {
+    uint16_t attr0;  // Atributo 0: Posição Y, Modo, Shape, etc.
+    uint16_t attr1;  // Atributo 1: Posição X, Tamanho, Flip, etc.
+    uint16_t attr2;  // Atributo 2: Índice do Tile, Prioridade, Paleta, etc.
+    uint16_t fill;   // Reservado (para dados de rotação/escala)
+};
+
+// ============================================================================
+// TABELA DE DIMENSÕES DE SPRITES
+// ============================================================================
+
+// Índices: [shape][size] = {width, height}
+// shape: 0=Square, 1=Horizontal, 2=Vertical, 3=Reserved
+// size: 0=Small, 1=Medium, 2=Large, 3=Extra Large
+constexpr int SPRITE_DIMS[4][4][2] = {
+    // Shape 0: Square
+    {{ 8,  8}, {16, 16}, {32, 32}, {64, 64}},
+    // Shape 1: Horizontal
+    {{16,  8}, {32,  8}, {32, 16}, {64, 32}},
+    // Shape 2: Vertical
+    {{ 8, 16}, { 8, 32}, {16, 32}, {32, 64}},
+    // Shape 3: Reserved
+    {{ 0,  0}, { 0,  0}, { 0,  0}, { 0,  0}}
+};
+
+// ============================================================================
+// UTILITÁRIOS PARA MANIPULAÇÃO DE BITFIELDS
+// ============================================================================
+
+namespace detail {
+    // Extrai um campo de bits de um valor
+    template<typename T>
+    inline T extract_bits(uint16_t value, int shift, int bits) {
+        return static_cast<T>((value >> shift) & ((1U << bits) - 1));
+    }
+
+    // Insere um campo de bits em um valor
+    inline uint16_t insert_bits(uint16_t value, uint16_t field, int shift, int bits) {
+        uint16_t mask = ((1U << bits) - 1) << shift;
+        return (value & ~mask) | ((field << shift) & mask);
+    }
+}
+
+// ============================================================================
+// CONSTANTES ADICIONAIS PARA CONVENIÊNCIA
+// ============================================================================
+
+// Constantes para prioridades
+constexpr int PRIORITY_HIGHEST = 0;
+constexpr int PRIORITY_LOWEST  = 3;
+constexpr int PRIORITY_BACKDROP = 4;
+constexpr int PRIORITY_OBJ_MIN = 0;
+constexpr int PRIORITY_OBJ_MAX = 3;
+
+// Constantes para source buffer
+constexpr int SOURCE_BG0     = 0;
+constexpr int SOURCE_BG1     = 1;
+constexpr int SOURCE_BG2     = 2;
+constexpr int SOURCE_BG3     = 3;
+constexpr int SOURCE_OBJ     = 4;
+constexpr int SOURCE_BACKDROP = 5;
+
+// Constantes para tamanhos de bloco
+constexpr size_t CHARBLOCK_SIZE = 16 * 1024;  // 16 KB
+constexpr size_t SCREENBLOCK_SIZE = 2 * 1024; // 2 KB
+
+} // namespace zgba::video
+
+#endif // ZGBA_VIDEO_TYPES_HPPzero@DESKTOP-SPF6KES:~/zGBA$
+zero@DESKTOP-SPF6KES:~/zGBA$ cat src/platform/emulador.hpp
+#pragma once
+#include <string>
+#include <cstdint>
+#include "rom_loader.hpp"
+#include "input.hpp"
+#include "renderer.hpp"
+#include "audio_backend.hpp"
+#include "../core/memory/memory_map.hpp"
+#include "../core/memory/bus.hpp"
+#include "../core/cpu/cpu.hpp"
+#include "../core/video/ppu.hpp"
+#include "../debug/debugger.hpp"
+
+class Emulador {
+public:
+    Emulador();
+    ~Emulador() = default;
+
+    bool init(const std::string& rom_path);
+    void run();
+
+    void enable_debugger(bool enable, uint32_t initial_breakpoint = 0x08000000) {
+        debugger.set_enabled(enable);
+        if (enable) {
+            debugger.add_breakpoint(initial_breakpoint);
+        }
+    }
+
+private:
+    void step();
+
+    bool is_running;
+
+    static constexpr int CYCLES_PER_SCANLINE = 1232;
+    static constexpr int SCANLINES_PER_FRAME = 228;
+    static constexpr int CYCLES_PER_FRAME = CYCLES_PER_SCANLINE * SCANLINES_PER_FRAME;
+
+    RomLoader loader;
+    Input input;
+    Renderer renderer;
+    AudioBackend audio;
+
+    zgba::memory::MemoryMap memory_map;
+    zgba::memory::Bus memory_bus{memory_map};
+    zGBA::CPU::ARM7TDMI::CPU cpu;
+    zgba::video::PPU ppu;
+
+    zgba::debug::Debugger debugger{cpu}; // Adicionado aqui
+
+    uint32_t framebuffer[240 * 160];
+};zero@DESKTOP-SPF6KES:~/zGBA$ cat src/platform/emulad.cpp
+#include "emulador.hpp"
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+
+Emulador::Emulador() : is_running(false) {
+    std::fill(std::begin(framebuffer), std::end(framebuffer), 0xFF000000);
+
+    zGBA::CPU::ARM7TDMI::CPU::MemoryBus cpu_bus_callbacks{
+        [this](uint32_t addr) { return memory_bus.read8(addr, cpu.get_registers().get_pc()); },
+        [this](uint32_t addr) { return memory_bus.read16(addr, cpu.get_registers().get_pc()); },
+        [this](uint32_t addr) { return memory_bus.read32(addr, cpu.get_registers().get_pc()); },
+        [this](uint32_t addr, uint8_t val) { memory_bus.write8(addr, val); },
+        [this](uint32_t addr, uint16_t val) { memory_bus.write16(addr, val); },
+        [this](uint32_t addr, uint32_t val) { memory_bus.write32(addr, val); }
+    };
+    cpu.set_bus(cpu_bus_callbacks);
+}
+
+bool Emulador::init(const std::string& rom_path) {
+    if (!renderer.init("zGBA - Game Boy Advance Emulator", 3)) {
+        return false;
+    }
+
+    // Carrega a BIOS embutida diretamente
+    if (!loader.loadEmbeddedBios(memory_map)) {
+        std::cerr << "Erro fatal: Falha ao carregar a BIOS embutida." << std::endl;
+        return false;
+    }
+
+    if (!loader.loadGamePak(rom_path, memory_map)) {
+        std::cerr << "Erro fatal: Falha ao carregar a ROM do Game Pak." << std::endl;
+        return false;
+    }
+
+    cpu.reset();
+    is_running = true;
+    return true;
+}
+
+void Emulador::run() {
+    is_running = true;
+    const auto frame_duration = std::chrono::nanoseconds(16742706);
+
+    while (is_running) {
+        auto frame_start = std::chrono::high_resolution_clock::now();
+        input.pollEvents(is_running);
+
+        uint32_t frame_cycles = 0;
+        while (frame_cycles < CYCLES_PER_FRAME && is_running) {
+            debugger.update();
+            cpu.step();
+            uint64_t cycles_spent = memory_bus.consume_cycles();
+            if (cycles_spent == 0) cycles_spent = 1;
+            frame_cycles += static_cast<uint32_t>(cycles_spent);
+            ppu.step(static_cast<uint32_t>(cycles_spent), memory_bus);
+        }
+
+        const auto& ppu_fb = ppu.get_framebuffer();
+        std::copy(ppu_fb.begin(), ppu_fb.end(), std::begin(framebuffer));
+
+        renderer.renderFrame(framebuffer);
+
+        // resto do controle de timing (spin-lock) permanece igual
+        auto frame_end = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(frame_end - frame_start);
+        if (elapsed < frame_duration) {
+            auto sleep_time = frame_duration - elapsed;
+            if (sleep_time > std::chrono::milliseconds(1)) {
+                std::this_thread::sleep_for(sleep_time - std::chrono::milliseconds(1));
+            }
+            while (std::chrono::high_resolution_clock::now() - frame_start < frame_duration) {}
+        }
+    }
+}
+
+void Emulador::step() {
+    debugger.update();
+    cpu.step();
+    uint64_t cycles_spent = memory_bus.consume_cycles();
+    if (cycles_spent == 0) cycles_spent = 1;
+    ppu.step(static_cast<uint32_t>(cycles_spent), memory_bus);
+}
+zero@DESKTOP-SPF6KES:~/zGBA$
